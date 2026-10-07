@@ -1,0 +1,63 @@
+# Every provider here speaks the OpenAI Chat Completions format.
+# Switch with: cirrus ask "question" --provider <name>
+#
+# base_url        full chat completions URL
+# api_key_env     name of the variable in .env that holds the key (null = no key)
+# context_window  tokens the model accepts, input + output (check the model card)
+# prices          US dollars per million tokens (check the provider's pricing page)
+
+default: nvidia
+
+providers:
+  nvidia:
+    base_url: https://integrate.api.nvidia.com/v1/chat/completions
+    api_key_env: LLM_API_KEY
+    model: nvidia/nemotron-3-super-120b-a12b
+    context_window: 131072
+    reserved_output_tokens: 4096
+    prices: # free tier
+      input: 0
+      cached_input: 0
+      output: 0
+
+  openrouter:
+    base_url: https://openrouter.ai/api/v1/chat/completions
+    api_key_env: OPENROUTER_API_KEY
+    model: nvidia/nemotron-3-ultra-550b-a55b:free
+    context_window: 131072
+    reserved_output_tokens: 4096
+    prices: # free model
+      input: 0
+      cached_input: 0
+      output: 0
+
+  groq:
+    base_url: https://api.groq.com/openai/v1/chat/completions
+    api_key_env: GROQ_API_KEY
+    model: llama-3.3-70b-versatile
+    context_window: 131072
+    reserved_output_tokens: 4096
+    prices:
+      input: 0.59
+      output: 0.79
+
+  gemini:
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
+    api_key_env: GEMINI_API_KEY
+    model: gemini-2.5-flash
+    context_window: 1048576
+    reserved_output_tokens: 8192
+    prices:
+      input: 0.30
+      cached_input: 0.075
+      output: 2.50
+
+  ollama:
+    base_url: http://localhost:11434/v1/chat/completions
+    api_key_env: null
+    model: llama3.2
+    context_window: 8192
+    reserved_output_tokens: 1024
+    prices: # runs on your own machine
+      input: 0
+      output: 0
