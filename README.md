@@ -9,7 +9,8 @@ No OpenAI SDK. No Google or Groq SDK. No LangChain. Just `POST` requests and JSO
 ![Pydantic](https://img.shields.io/badge/Pydantic-2.x-E92063?style=flat-square&logo=pydantic&logoColor=white)
 ![httpx](https://img.shields.io/badge/httpx%20%2B%20requests-raw%20HTTP-0A7BBB?style=flat-square)
 ![tiktoken](https://img.shields.io/badge/tiktoken-token%20counting-412991?style=flat-square)
-![pytest](https://img.shields.io/badge/tests-119%20passing-1a7f37?style=flat-square&logo=pytest&logoColor=white)
+![SSE](https://img.shields.io/badge/SSE%20parser-hand--written-bc4c00?style=flat-square)
+![pytest](https://img.shields.io/badge/tests-163%20passing-1a7f37?style=flat-square&logo=pytest&logoColor=white)
 
 </div>
 
@@ -19,7 +20,10 @@ Most people talk to LLMs through an SDK, and the SDK hides what really happens.
 
 Underneath, a call to a model is **one HTTP request with a list of messages in it**. Chat memory isn't memory, just the client sending the old messages again. Cost isn't a mystery, just three token counts times three prices. I wanted to see all of that with my own eyes, so I'm building **Cirrus**, an assistant that will one day help run an AWS account, starting from the very bottom.
 
-This repo is stage **1: Talk to models**, challenge **1.1: A model client from scratch**.
+This repo is stage **1: Talk to models**:
+
+- **1.1: A model client from scratch**: raw HTTP, chat history, token counting and exact cost
+- **1.2: Streaming, parsed by hand**: answers printed as they're generated, through a Server-Sent Events parser I wrote myself
 
 > **A note on authorship:** I wrote the code myself, because writing it is how I learn the concepts. The tests and this README were written by AI. I spent the tokens on thinking, AI spent them on typing. Fair trade, and like every call in this repo, it came to exactly $0.000000.
 
@@ -43,6 +47,23 @@ This repo is stage **1: Talk to models**, challenge **1.1: A model client from s
 | An input of 500,000 words is refused before any request is sent | ✅ shown below |
 | The same question works on two providers by changing only the config | 🔜 waiting for a second API key (NVIDIA works; Groq, Gemini, OpenRouter and Ollama are already in `providers.yml`) |
 
+## ✅ Challenge 1.2
+
+| What to build | |
+|---|---|
+| Stream answers in `cirrus ask` and `cirrus chat`, printing text as it arrives | ✅ on by default, `--no-stream` to wait |
+| My own SSE parser: raw byte chunks split anywhere, ignores `:` comments, stops at `data: [DONE]` | ✅ `app/utils/sse_parser.py` |
+| Read the final usage if the provider sends it, otherwise estimate it and mark it | ✅ |
+| Print time to first token and tokens per second | ✅ |
+| FastAPI `POST /chat` that re-streams as SSE | ⏭️ skipped for now, Cirrus is a CLI chatbot |
+
+| Prove it | |
+|---|---|
+| The test chunks give exactly `Hello` and report that the stream finished | ✅ `test/utils/test_sse_parser.py` |
+| Feeding the same bytes one at a time gives the same result | ✅ `test/utils/test_sse_parser.py` |
+| `curl -N` shows events arriving one by one from the endpoint | ⏭️ needs the FastAPI endpoint |
+| Closing curl mid-answer cancels the upstream request | ⏭️ needs the FastAPI endpoint (in the CLI, Ctrl+C closes the connection, which cancels the request) |
+
 ---
 
 ## 🏗️ Architecture
@@ -51,7 +72,7 @@ This repo is stage **1: Talk to models**, challenge **1.1: A model client from s
 flowchart TD
     CLI["🖥️ cirrus ask / cirrus chat<br/>--provider · --no-history"]
     CFG["📄 providers.yml<br/>URL · key variable · model<br/>context window · prices"]
-    HIST["🗂️ agent_with_history.py<br/>add question · trim history"]
+    HIST["🗂️ cirrus_chat_agent.py<br/>add question · trim history"]
     VAL{"🛡️ Pydantic<br/>valid conversation?"}
     FIT{"📏 Fits the<br/>context window?"}
     REFUSE["⛔ Refused<br/>nothing is sent"]
@@ -188,6 +209,113 @@ Error: Unknown provider 'nope'. Choose one of: nvidia, openrouter, groq, gemini,
 
 ---
 
+## 🌊 Streaming, Parsed by Hand
+
+A model writes one token at a time. Waiting for the whole answer means staring at nothing until the last token is done. Streaming prints each piece the moment it's generated:
+
+```text
+$ uv run cirrus ask "Name three AWS storage services, one line each."
+Amazon S3
+Amazon EBS
+Amazon Glacier
+  in 31 tok | out 73 tok | 1.36s | TTFT 1.32s | 241.4 tok/s | $0.000000 | nvidia/nemotron-3-super-120b-a12b via nvidia
+```
+
+Two new numbers describe how fast a model *feels*:
+
+- **TTFT (time to first token):** how long until the first word of the answer shows up.
+- **Tokens per second:** how fast the rest of it arrives.
+
+Here TTFT is nearly the whole 1.36s, and the text then arrives at 241 tok/s. That's because Nemotron *thinks* before it answers: it streams its reasoning first (as `reasoning_content`, which Cirrus doesn't print), then the visible answer comes very fast.
+
+### What the provider actually sends
+
+Streams use **Server-Sent Events** (SSE). It's plain text: lines that start with `data:`, and a blank line ends each event. Here's the real stream from NVIDIA, trimmed:
+
+```text
+data: {"choices":[{"delta":{"reasoning_content":"The"}}], ..., "usage":null}
+
+data: {"choices":[{"delta":{"content":"Amazon S3"}}], ..., "usage":null}
+
+data: {"choices":[], ..., "usage":{"prompt_tokens":22,"completion_tokens":111, ...}}
+
+data: [DONE]
+```
+
+Each event carries a small JSON chunk with a `delta`, the new piece of text. The last chunk has empty `choices` and the token `usage`, and `data: [DONE]` ends the stream.
+
+### Why I needed my own parser
+
+The network doesn't care about events. When I recorded one real response, **43 network chunks carried about 14 KB of events**, and the chunk edges fell wherever they liked: in the middle of a line, in the middle of a JSON string, even in the middle of `data:`.
+
+So reading "one chunk = one event" breaks. The parser has to **keep the unfinished part and wait for more**. This is the test data from the challenge:
+
+```python
+chunks = [
+    b': ping\n\n',                                             # comment, ignore it
+    b'data: {"choices":[{"delta":{"content":"Hel"}}]}\n',      # event not finished yet
+    b'\ndata: {"choices":[{"delta":{"content":"lo"}}]}\n\nda', # ends "Hel", then "lo", then half a word
+    b'ta: [DONE]\n\n',                                         # the other half: stream is done
+]
+```
+
+`SSEParser` turns that into exactly `Hello` and reports the stream as finished. Feeding the same bytes **one at a time** gives the same result, which is the real test that no chunk boundary can break it.
+
+```mermaid
+flowchart LR
+    BYTES["📦 raw bytes<br/>split anywhere"] --> DEC["🔤 UTF-8 decoder<br/>keeps half characters"]
+    DEC --> BUF["🧺 buffer<br/>keeps half lines"]
+    BUF --> LINE{"one full line"}
+    LINE -->|": ..."| SKIP["🙈 comment, ignored"]
+    LINE -->|"data: ..."| DATA["➕ add to event"]
+    LINE -->|blank line| EVENT["✅ event done"]
+    EVENT -->|"[DONE]"| STOP["🛑 stream finished"]
+    EVENT -->|JSON| OUT["🌊 yield chunk"]
+
+    style BYTES fill:#6e7781,stroke:#6e7781,color:#fff
+    style BUF fill:#8250df,stroke:#8250df,color:#fff
+    style EVENT fill:#1a7f37,stroke:#1a7f37,color:#fff
+    style STOP fill:#cf222e,stroke:#cf222e,color:#fff
+    style OUT fill:#0969da,stroke:#0969da,color:#fff
+```
+
+<details>
+<summary><b>The edge cases that make it a real parser</b>: <code>app/utils/sse_parser.py</code></summary>
+
+<br/>
+
+| Case | What the parser does |
+|---|---|
+| A line split between chunks | keeps it in the buffer until the line ends |
+| `\r\n`, `\n` or `\r` line endings | all three end a line |
+| `\r` at the very end of a chunk | waits, because the `\n` of a `\r\n` may be in the next chunk |
+| An emoji split between chunks | an incremental UTF-8 decoder keeps the half character |
+| `: ping` comment lines | ignored (providers send them to keep the connection alive) |
+| Several `data:` lines in one event | joined with `\n` |
+| `data:value` with no space | works, and only one leading space is ever removed |
+| `event:`, `id:`, `retry:` | `event` is kept, the others are ignored |
+| Anything after `data: [DONE]` | ignored |
+| Stream ends without the last blank line | the last event is still delivered |
+
+No SSE library: it's plain Python, under 200 lines including docstrings, with 18 tests of its own.
+
+</details>
+
+<details>
+<summary><b>Usage, TTFT and speed</b>: <code>cirrus_chat_agent.py</code></summary>
+
+<br/>
+
+- **Usage:** Cirrus asks for it with `"stream_options": {"include_usage": true}`, the OpenAI way, and reads it from the last chunk. If a provider doesn't send it, the tokens are counted locally and the line says `tokens estimated`.
+- **TTFT:** measured from sending the request to the first piece of *visible* answer text.
+- **Tokens per second:** tokens of answer text after the first one, divided by the time since the first one.
+- **History:** a turn is saved only when the stream finishes. If it fails halfway, or you press Ctrl+C, the half answer is never saved, and closing the connection cancels the request at the provider.
+- **Errors inside the stream:** a provider can send `data: {"error": ...}` in the middle of a 200 response. That's raised as an error, not printed as an answer.
+
+</details>
+
+---
+
 ## 💲 What a Call Costs
 
 The challenge's test data:
@@ -295,7 +423,7 @@ Two things I had to think about:
 </details>
 
 <details>
-<summary><b>4. Trimming vs refusing</b>: <code>agent_with_history.py</code></summary>
+<summary><b>4. Trimming vs refusing</b>: <code>cirrus_chat_agent.py</code></summary>
 
 <br/>
 
@@ -425,10 +553,10 @@ app/
 ├── main.py                        # 🖥️ cirrus ask / cirrus chat
 ├── config.py                      # loads providers.yml, reads API keys from .env
 ├── agents/
-│   └── agent_with_history.py      # 🗂️ history, trimming, latency, usage, cost
+│   └── cirrus_chat_agent.py       # 🗂️ history, trimming, streaming, latency, usage, cost
 ├── handlers/llm/
 │   ├── base.py                    # BaseLlmHandler: the interface
-│   ├── llm_client_handlers.py     # 🌐 raw HTTP client + context window check
+│   ├── llm_client_handlers.py     # 🌐 raw HTTP client, streaming, context window check
 │   └── factory.py                 # get_llm_client(), cached
 ├── schemas/
 │   ├── prompt_templates.py        # 🛡️ message models + conversation rules
@@ -440,6 +568,7 @@ app/
 ├── utils/
 │   ├── tokens.py                  # tiktoken counting
 │   ├── cost.py                    # 💲 calculate_cost
+│   ├── sse_parser.py              # 🌊 hand-written Server-Sent Events parser
 │   └── formatting.py              # the stats line
 └── exceptions/                    # ⚠️ LlmClientError, ContextWindowExceededError, ProviderConfigError
 
@@ -472,6 +601,7 @@ uv run cirrus ask "What is Amazon S3?"
 uv run cirrus ask "What is Amazon S3?" --provider groq
 uv run cirrus chat
 uv run cirrus chat --no-history
+uv run cirrus ask "What is Amazon S3?" --no-stream   # wait for the whole answer
 cat long_question.txt | uv run cirrus ask -     # read the question from stdin
 ```
 
@@ -485,7 +615,7 @@ Ctrl+C to quit a chat.
 uv run pytest
 ```
 
-119 tests, written as `unittest.TestCase` classes and run with pytest. They never call a real model: HTTP is faked with `unittest.mock` and `httpx.MockTransport`. The `test/` folders mirror `app/`, so the tests for `app/utils/cost.py` are in `test/utils/test_cost.py`.
+163 tests, written as `unittest.TestCase` classes and run with pytest. They never call a real model: HTTP is faked with `unittest.mock` and `httpx.MockTransport`. The `test/` folders mirror `app/`, so the tests for `app/utils/cost.py` are in `test/utils/test_cost.py`.
 
 ---
 
@@ -518,11 +648,23 @@ One `yield` turns a function into a generator, and the request never runs. Strea
 **Good errors are part of the design.**
 `except Exception` felt safe and hid every bug. Specific errors with one clear sentence each make the tool easier to use *and* easier to debug.
 
+**The network doesn't respect your format.**
+Chunks arrive split anywhere: mid-line, mid-JSON, even mid-character. A parser has to keep what's unfinished and wait. Feeding it one byte at a time is the honest test.
+
+**Streaming is a format, not magic.**
+SSE is just `data:` lines and blank lines. Once I wrote the parser, "streaming" stopped being a library feature and became a loop over bytes.
+
+**Speed has two numbers.**
+Time to first token is how fast a model *feels*. Tokens per second is how fast it *is*. A reasoning model can have a slow first token and then race through the answer.
+
+**Half an answer is not an answer.**
+If a stream breaks, the half reply is never saved to the history. The next question shouldn't build on something the model never finished saying.
+
 ---
 
 <div align="center">
 
 A model is a function that takes a list of messages and returns a few more tokens.
-**Memory, cost and safety are all the client's job.** ☁️
+**Memory, cost, streaming and safety are all the client's job.** ☁️
 
 </div>

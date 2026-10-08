@@ -62,6 +62,12 @@ class LlmAnswer(BaseModel):
         Time from sending the request to getting the full reply.
     cost : Decimal
         Cost of the call in US dollars.
+    time_to_first_token_seconds : float | None
+        Streaming only: time from sending the request to the first piece of
+        visible answer text. ``None`` when not streamed or no text came back.
+    tokens_per_second : float | None
+        Streaming only: tokens of answer text per second after the first
+        token. ``None`` when not streamed or too little text to measure.
     """
 
     text: str
@@ -70,3 +76,5 @@ class LlmAnswer(BaseModel):
     usage: TokenUsage
     latency_seconds: NonNegativeFloat
     cost: Decimal
+    time_to_first_token_seconds: NonNegativeFloat | None = None
+    tokens_per_second: NonNegativeFloat | None = None

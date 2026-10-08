@@ -31,7 +31,7 @@ class BaseLlmHandler(ABC):
         ...
 
     @abstractmethod
-    def stream(self, prompt: str | Messages, **additional_kwargs) -> Generator[str]:
+    def stream(self, prompt: str | Messages, **additional_kwargs) -> Generator[dict]:
         """
         Call the LLM and yield the response as it arrives.
 
@@ -44,8 +44,9 @@ class BaseLlmHandler(ABC):
 
         Yields
         ------
-        str
-            One line of the streamed response.
+        dict
+            One streamed JSON chunk, e.g.
+            ``{"choices": [{"delta": {"content": "Hel"}}]}``.
         """
         ...
 
@@ -71,7 +72,7 @@ class BaseLlmHandler(ABC):
     @abstractmethod
     def astream(
         self, prompt: str | Messages, **additional_kwargs
-    ) -> AsyncGenerator[str]:
+    ) -> AsyncGenerator[dict]:
         """
         Call the LLM asynchronously and yield the response as it arrives.
 
@@ -84,8 +85,9 @@ class BaseLlmHandler(ABC):
 
         Yields
         ------
-        str
-            One line of the streamed response.
+        dict
+            One streamed JSON chunk, e.g.
+            ``{"choices": [{"delta": {"content": "Hel"}}]}``.
         """
         ...
 

@@ -54,3 +54,30 @@ class TestLlmAnswer(unittest.TestCase):
                 latency_seconds=-1,
                 cost=Decimal(0),
             )
+
+    def test_streaming_stats_are_optional(self):
+        answer = LlmAnswer(
+            text="x",
+            provider="p",
+            model="m",
+            usage=TokenUsage(input_tokens=1, output_tokens=1),
+            latency_seconds=1,
+            cost=Decimal(0),
+        )
+
+        self.assertIsNone(answer.time_to_first_token_seconds)
+        self.assertIsNone(answer.tokens_per_second)
+
+    def test_streaming_stats_cannot_be_negative(self):
+        for field in ("time_to_first_token_seconds", "tokens_per_second"):
+            with self.subTest(field=field):
+                with self.assertRaises(ValidationError):
+                    LlmAnswer(
+                        text="x",
+                        provider="p",
+                        model="m",
+                        usage=TokenUsage(input_tokens=1, output_tokens=1),
+                        latency_seconds=1,
+                        cost=Decimal(0),
+                        **{field: -1},
+                    )
