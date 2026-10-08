@@ -31,8 +31,9 @@ def format_answer_stats(answer: LlmAnswer) -> str:
     Returns
     -------
     str
-        Input tokens, output tokens, latency, cost and model, e.g.
-        ``in 1,000 tok (600 cached) | out 200 tok | 1.23s | $0.001260 | model via nvidia``.
+        Input tokens, output tokens, latency, time to first token and
+        tokens per second (when streamed), cost and model, e.g.
+        ``in 22 tok | out 87 tok | 1.23s | TTFT 0.41s | 52.3 tok/s | $0.000000 | model via nvidia``.
         Token counts start with ``~`` when they were estimated locally.
     """
     usage = answer.usage
@@ -46,6 +47,12 @@ def format_answer_stats(answer: LlmAnswer) -> str:
         input_part,
         f"out {approx}{usage.output_tokens:,} tok",
         f"{answer.latency_seconds:.2f}s",
+    ]
+    if answer.time_to_first_token_seconds is not None:
+        parts.append(f"TTFT {answer.time_to_first_token_seconds:.2f}s")
+    if answer.tokens_per_second is not None:
+        parts.append(f"{answer.tokens_per_second:.1f} tok/s")
+    parts += [
         format_cost(answer.cost),
         f"{answer.model} via {answer.provider}",
     ]

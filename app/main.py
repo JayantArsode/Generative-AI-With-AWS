@@ -1,15 +1,16 @@
 import argparse
 import asyncio
 import sys
-from app.agents.agent_with_history import call_agent_with_history
+from app.agents.cirrus_chat_agent import call_agent, call_agent_with_stream
 from app.config import get_provider
 from app.exceptions import (
     ContextWindowExceededError,
     LlmClientError,
     ProviderConfigError,
 )
-from app.utils.formatting import format_answer_stats
+from app.schemas.llm_response import LlmAnswer
 from app.schemas.provider_config import ProviderConfig
+from app.utils.formatting import format_answer_stats
 
 # Errors we expect and can explain in one line. Anything else is a bug.
 USER_FACING_ERRORS = (
@@ -32,7 +33,69 @@ def print_error(error: Exception) -> None:
     print(f"Error: {error}", file=sys.stderr)
 
 
-async def ask(provider: ProviderConfig, question: str) -> int:
+async def answer_question(
+    provider: ProviderConfig,
+    question: str,
+    use_history: bool,
+    stream: bool,
+    prefix: str = "",
+) -> LlmAnswer:
+    """
+    Get an answer and print it to stdout, piece by piece when streaming.
+
+    Parameters
+    ----------
+    provider : ProviderConfig
+        The provider and model to call.
+    question : str
+        The question to ask.
+    use_history : bool
+        Send and save the chat history.
+    stream : bool
+        Print the answer as it is generated instead of all at once.
+    prefix : str, optional
+        Printed before the answer, e.g. ``"> "`` in the chat, by default "".
+
+    Returns
+    -------
+    LlmAnswer
+        The full answer with its stats.
+
+    Raises
+    ------
+    ProviderConfigError, ValueError, ContextWindowExceededError, LlmClientError
+        Passed on from the agent. If part of a streamed answer was already
+        printed, the line is ended first so the error starts on its own line.
+    """
+    if not stream:
+        answer = await call_agent(
+            provider=provider, user_query=question, use_history=use_history
+        )
+        print(f"{prefix}{answer.text}", flush=True)
+        return answer
+
+    printed_anything = False
+    try:
+        async for piece in call_agent_with_stream(
+            provider=provider, user_query=question, use_history=use_history
+        ):
+            if isinstance(piece, LlmAnswer):
+                answer = piece
+                continue
+            if not printed_anything:
+                print(prefix, end="")
+                printed_anything = True
+            print(piece, end="", flush=True)
+    finally:
+        if printed_anything:
+            print(flush=True)
+
+    if not printed_anything:
+        print(prefix, flush=True)
+    return answer
+
+
+async def ask(provider: ProviderConfig, question: str, stream: bool = True) -> int:
     """
     Ask one question without any chat history and print the answer.
 
@@ -42,6 +105,8 @@ async def ask(provider: ProviderConfig, question: str) -> int:
         The provider and model to call.
     question : str
         The question to ask.
+    stream : bool, optional
+        Print the answer as it is generated, by default True.
 
     Returns
     -------
@@ -49,19 +114,20 @@ async def ask(provider: ProviderConfig, question: str) -> int:
         Exit code: 0 on success, 1 on error.
     """
     try:
-        answer = await call_agent_with_history(
-            provider=provider, user_query=question, use_history=False
+        answer = await answer_question(
+            provider, question, use_history=False, stream=stream
         )
     except USER_FACING_ERRORS as e:
         print_error(e)
         return 1
 
-    print(answer.text, flush=True)
     print(format_answer_stats(answer), file=sys.stderr)
     return 0
 
 
-async def chat(provider: ProviderConfig, use_history: bool = True) -> int:
+async def chat(
+    provider: ProviderConfig, use_history: bool = True, stream: bool = True
+) -> int:
     """
     Chat with the LLM from the console.
 
@@ -75,6 +141,8 @@ async def chat(provider: ProviderConfig, use_history: bool = True) -> int:
         The provider and model to call.
     use_history : bool, optional
         Send the earlier turns with each question, by default True.
+    stream : bool, optional
+        Print each answer as it is generated, by default True.
 
     Returns
     -------
@@ -82,9 +150,10 @@ async def chat(provider: ProviderConfig, use_history: bool = True) -> int:
         Exit code, always 0.
     """
     history_note = "history on" if use_history else "history off"
+    stream_note = "streaming" if stream else "not streaming"
     print(
-        f"Chatting with {provider.name} ({provider.model}), {history_note}. "
-        "Ctrl+C to quit.",
+        f"Chatting with {provider.name} ({provider.model}), {history_note}, "
+        f"{stream_note}. Ctrl+C to quit.",
         file=sys.stderr,
     )
 
@@ -98,14 +167,13 @@ async def chat(provider: ProviderConfig, use_history: bool = True) -> int:
             continue
 
         try:
-            answer = await call_agent_with_history(
-                provider=provider, user_query=user_query, use_history=use_history
+            answer = await answer_question(
+                provider, user_query, use_history, stream, prefix="> "
             )
         except USER_FACING_ERRORS as e:
             print_error(e)
             continue
 
-        print(">", answer.text, flush=True)
         print(format_answer_stats(answer), file=sys.stderr)
 
 
@@ -122,6 +190,11 @@ def build_parser() -> argparse.ArgumentParser:
     shared.add_argument(
         "--provider",
         help="provider name from providers.yml (default: the file's default)",
+    )
+    shared.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="wait for the whole answer instead of printing it as it arrives",
     )
 
     parser = argparse.ArgumentParser(
@@ -172,8 +245,14 @@ def run(argv: list[str] | None = None) -> int:
     try:
         if args.command == "ask":
             question = sys.stdin.read() if args.question == "-" else args.question
-            return asyncio.run(ask(provider, question))
-        return asyncio.run(chat(provider, use_history=not args.no_history))
+            return asyncio.run(ask(provider, question, stream=not args.no_stream))
+        return asyncio.run(
+            chat(
+                provider,
+                use_history=not args.no_history,
+                stream=not args.no_stream,
+            )
+        )
     except KeyboardInterrupt:
         print("\nBye!", file=sys.stderr)
         return 0

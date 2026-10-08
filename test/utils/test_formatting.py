@@ -54,3 +54,20 @@ class TestFormatAnswerStats(unittest.TestCase):
         self.assertIn("in ~10 tok", stats)
         self.assertIn("out ~2 tok", stats)
         self.assertTrue(stats.endswith("tokens estimated"))
+
+    def test_streamed_answer_shows_ttft_and_speed(self):
+        answer = make_answer(TokenUsage(input_tokens=22, output_tokens=87)).model_copy(
+            update={"time_to_first_token_seconds": 0.412, "tokens_per_second": 52.34}
+        )
+
+        self.assertEqual(
+            format_answer_stats(answer),
+            "  in 22 tok | out 87 tok | 1.23s | TTFT 0.41s | 52.3 tok/s"
+            " | $0.001260 | llama via groq",
+        )
+
+    def test_not_streamed_has_no_ttft_or_speed(self):
+        stats = format_answer_stats(make_answer(TokenUsage(input_tokens=1, output_tokens=1)))
+
+        self.assertNotIn("TTFT", stats)
+        self.assertNotIn("tok/s", stats)

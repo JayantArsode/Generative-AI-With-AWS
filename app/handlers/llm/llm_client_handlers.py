@@ -2,7 +2,9 @@ from typing import AsyncGenerator, Generator
 from app.handlers.llm.base import BaseLlmHandler
 from app.exceptions import ContextWindowExceededError, LlmClientError
 from app.schemas.prompt_templates import Messages
+from app.utils.sse_parser import SSEEvent, SSEParser
 from app.utils.tokens import count_message_tokens
+import json
 import requests
 import httpx
 
@@ -26,6 +28,40 @@ def _http_error_message(status_code: int, body: str) -> str:
         Message with the status code and the start of the response body.
     """
     return f"LLM returned HTTP {status_code}: {body[:500]}"
+
+
+def _event_to_chunk(event: SSEEvent) -> dict:
+    """
+    Turn one streamed event into the JSON chunk it carries.
+
+    Parameters
+    ----------
+    event : SSEEvent
+        An event from the SSE parser.
+
+    Returns
+    -------
+    dict
+        The chunk, e.g. ``{"choices": [{"delta": {"content": "Hel"}}]}``.
+
+    Raises
+    ------
+    LlmClientError
+        If the event data is not a JSON object.
+    """
+    try:
+        chunk = json.loads(event.data)
+    except json.JSONDecodeError as je:
+        raise LlmClientError(
+            f"LLM streamed invalid JSON: {event.data[:200]!r}"
+        ) from je
+    if not isinstance(chunk, dict):
+        raise LlmClientError(f"LLM streamed an unexpected chunk: {event.data[:200]!r}")
+    return chunk
+
+
+# Ask OpenAI-compatible providers to send token usage in the last chunk
+STREAM_PAYLOAD = {"stream": True, "stream_options": {"include_usage": True}}
 
 
 class HTTPLlmClientHandler(BaseLlmHandler):
@@ -166,9 +202,12 @@ class HTTPLlmClientHandler(BaseLlmHandler):
         except requests.RequestException as re:
             raise LlmClientError(f"Could not reach the LLM: {re}") from re
 
-    def stream(self, prompt: str | Messages, **additional_kwargs) -> Generator[str]:
+    def stream(self, prompt: str | Messages, **additional_kwargs) -> Generator[dict]:
         """
-        Call the LLM and yield the response as it arrives.
+        Call the LLM and yield the response chunks as they arrive.
+
+        The raw bytes are parsed with ``SSEParser``, and the stream stops at
+        ``data: [DONE]``.
 
         Parameters
         ----------
@@ -179,8 +218,9 @@ class HTTPLlmClientHandler(BaseLlmHandler):
 
         Yields
         ------
-        str
-            One non-empty line of the streamed response.
+        dict
+            One streamed JSON chunk, e.g.
+            ``{"choices": [{"delta": {"content": "Hel"}}]}``.
 
         Raises
         ------
@@ -189,9 +229,13 @@ class HTTPLlmClientHandler(BaseLlmHandler):
         ContextWindowExceededError
             If the prompt would not fit the context window. Nothing is sent.
         LlmClientError
-            If the LLM cannot be reached, times out or returns an error status.
+            If the LLM cannot be reached, times out, returns an error status
+            or streams something that is not a JSON object.
         """
-        invoke_payload = self.__get_llm_payload(prompt, stream=True, **additional_kwargs)
+        invoke_payload = self.__get_llm_payload(
+            prompt, **{**STREAM_PAYLOAD, **additional_kwargs}
+        )
+        parser = SSEParser()
         try:
             with requests.post(
                 url=self.base_url,
@@ -201,11 +245,13 @@ class HTTPLlmClientHandler(BaseLlmHandler):
                 timeout=REQUEST_TIMEOUT_SECONDS,
             ) as response:
                 response.raise_for_status()
-                # Server-Sent Events are always UTF-8
-                response.encoding = "utf-8"
-                for line in response.iter_lines(decode_unicode=True):
-                    if line:
-                        yield line
+                for raw_chunk in response.iter_content(chunk_size=None):
+                    for event in parser.feed(raw_chunk):
+                        yield _event_to_chunk(event)
+                    if parser.done:
+                        return
+                for event in parser.finish():
+                    yield _event_to_chunk(event)
         except requests.HTTPError as httpe:
             raise LlmClientError(
                 _http_error_message(httpe.response.status_code, httpe.response.text)
@@ -260,9 +306,13 @@ class HTTPLlmClientHandler(BaseLlmHandler):
 
     async def astream(
         self, prompt: str | Messages, **additional_kwargs
-    ) -> AsyncGenerator[str]:
+    ) -> AsyncGenerator[dict]:
         """
-        Call the LLM asynchronously and yield the response as it arrives.
+        Call the LLM asynchronously and yield the response chunks as they arrive.
+
+        The raw bytes are parsed with ``SSEParser``, and the stream stops at
+        ``data: [DONE]``. If the caller stops reading early, the connection
+        is closed, which cancels the request at the provider.
 
         Parameters
         ----------
@@ -273,8 +323,9 @@ class HTTPLlmClientHandler(BaseLlmHandler):
 
         Yields
         ------
-        str
-            One non-empty line of the streamed response.
+        dict
+            One streamed JSON chunk, e.g.
+            ``{"choices": [{"delta": {"content": "Hel"}}]}``.
 
         Raises
         ------
@@ -283,9 +334,13 @@ class HTTPLlmClientHandler(BaseLlmHandler):
         ContextWindowExceededError
             If the prompt would not fit the context window. Nothing is sent.
         LlmClientError
-            If the LLM cannot be reached, times out or returns an error status.
+            If the LLM cannot be reached, times out, returns an error status
+            or streams something that is not a JSON object.
         """
-        invoke_payload = self.__get_llm_payload(prompt, stream=True, **additional_kwargs)
+        invoke_payload = self.__get_llm_payload(
+            prompt, **{**STREAM_PAYLOAD, **additional_kwargs}
+        )
+        parser = SSEParser()
         try:
             async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
                 async with client.stream(
@@ -299,8 +354,12 @@ class HTTPLlmClientHandler(BaseLlmHandler):
                         raise LlmClientError(
                             _http_error_message(response.status_code, response.text)
                         )
-                    async for line in response.aiter_lines():
-                        if line:
-                            yield line
+                    async for raw_chunk in response.aiter_bytes():
+                        for event in parser.feed(raw_chunk):
+                            yield _event_to_chunk(event)
+                        if parser.done:
+                            return
+                    for event in parser.finish():
+                        yield _event_to_chunk(event)
         except httpx.HTTPError as httpe:
             raise LlmClientError(f"Could not reach the LLM: {httpe!r}") from httpe
