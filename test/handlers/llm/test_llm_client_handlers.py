@@ -14,6 +14,26 @@ REAL_ASYNC_CLIENT = httpx.AsyncClient
 BASE_URL = "https://llm.example/v1/chat/completions"
 OK_RESPONSE = {"choices": [{"message": {"role": "assistant", "content": "Hello!"}}]}
 
+# The SSE test data from challenge 1.2, split across chunks at odd places
+SSE_CHUNKS = [
+    b": ping\n\n",
+    b'data: {"choices":[{"delta":{"content":"Hel"}}]}\n',
+    b'\ndata: {"choices":[{"delta":{"content":"lo"}}]}\n\nda',
+    b"ta: [DONE]\n\n",
+]
+SSE_CHUNKS_EXPECTED = [
+    {"choices": [{"delta": {"content": "Hel"}}]},
+    {"choices": [{"delta": {"content": "lo"}}]},
+]
+
+
+async def async_chunks(chunks):
+    """
+    Serve ``chunks`` one by one, like bytes arriving from the network.
+    """
+    for chunk in chunks:
+        yield chunk
+
 
 def make_client():
     return HTTPLlmClientHandler(base_url=BASE_URL, api_key="test-key", model="m")
@@ -107,16 +127,41 @@ class TestStream(unittest.TestCase):
         self.mock_post = patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_yields_non_empty_lines(self):
+    def test_parses_sse_into_json_chunks(self):
         self.mock_post.return_value = fake_requests_response(
-            200, 'data: {"a": 1}\n\ndata: [DONE]\n'
+            200, b"".join(SSE_CHUNKS).decode()
         )
 
-        lines = list(make_client().stream("hi"))
+        chunks = list(make_client().stream("hi"))
 
-        self.assertEqual(lines, ['data: {"a": 1}', "data: [DONE]"])
-        self.assertTrue(self.mock_post.call_args.kwargs["json"]["stream"])
-        self.assertTrue(self.mock_post.call_args.kwargs["stream"])
+        self.assertEqual(chunks, SSE_CHUNKS_EXPECTED)
+        kwargs = self.mock_post.call_args.kwargs
+        self.assertTrue(kwargs["stream"])
+        self.assertTrue(kwargs["json"]["stream"])
+        self.assertEqual(kwargs["json"]["stream_options"], {"include_usage": True})
+
+    def test_caller_can_override_stream_options(self):
+        self.mock_post.return_value = fake_requests_response(200, "data: [DONE]\n\n")
+
+        list(make_client().stream("hi", stream_options={"include_usage": False}))
+
+        self.assertEqual(
+            self.mock_post.call_args.kwargs["json"]["stream_options"],
+            {"include_usage": False},
+        )
+
+    def test_stops_at_done(self):
+        self.mock_post.return_value = fake_requests_response(
+            200, 'data: {"n": 1}\n\ndata: [DONE]\n\ndata: not json\n\n'
+        )
+
+        self.assertEqual(list(make_client().stream("hi")), [{"n": 1}])
+
+    def test_invalid_json_event(self):
+        self.mock_post.return_value = fake_requests_response(200, "data: oops\n\n")
+
+        with self.assertRaisesRegex(LlmClientError, "streamed invalid JSON"):
+            list(make_client().stream("hi"))
 
     def test_error_status(self):
         self.mock_post.return_value = fake_requests_response(500, "boom")
@@ -176,14 +221,49 @@ class TestAstream(unittest.IsolatedAsyncioTestCase):
 
     async def collect(self, handler):
         with patch_async_server(handler):
-            return [line async for line in make_client().astream("hi")]
+            return [chunk async for chunk in make_client().astream("hi")]
 
-    async def test_yields_non_empty_lines(self):
+    async def test_parses_chunks_split_anywhere(self):
+        seen = {}
+
+        def handler(request):
+            seen["body"] = json.loads(request.read())
+            return httpx.Response(200, content=async_chunks(SSE_CHUNKS))
+
+        self.assertEqual(await self.collect(handler), SSE_CHUNKS_EXPECTED)
+        self.assertTrue(seen["body"]["stream"])
+        self.assertEqual(seen["body"]["stream_options"], {"include_usage": True})
+
+    async def test_same_result_one_byte_at_a_time(self):
+        raw = b"".join(SSE_CHUNKS)
+        one_byte_chunks = [raw[i : i + 1] for i in range(len(raw))]
         handler = lambda request: httpx.Response(
-            200, text='data: {"a": 1}\n\ndata: [DONE]\n'
+            200, content=async_chunks(one_byte_chunks)
         )
 
-        self.assertEqual(await self.collect(handler), ['data: {"a": 1}', "data: [DONE]"])
+        self.assertEqual(await self.collect(handler), SSE_CHUNKS_EXPECTED)
+
+    async def test_stops_at_done(self):
+        handler = lambda request: httpx.Response(
+            200,
+            content=async_chunks(
+                [b'data: {"n": 1}\n\ndata: [DONE]\n\n', b"data: not json\n\n"]
+            ),
+        )
+
+        self.assertEqual(await self.collect(handler), [{"n": 1}])
+
+    async def test_invalid_json_event(self):
+        handler = lambda request: httpx.Response(200, text="data: [1, 2\n\n")
+
+        with self.assertRaisesRegex(LlmClientError, "streamed invalid JSON"):
+            await self.collect(handler)
+
+    async def test_non_object_event(self):
+        handler = lambda request: httpx.Response(200, text="data: [1, 2]\n\n")
+
+        with self.assertRaisesRegex(LlmClientError, "unexpected chunk"):
+            await self.collect(handler)
 
     async def test_error_status(self):
         handler = lambda request: httpx.Response(500, text="boom")
